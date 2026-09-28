@@ -1180,7 +1180,9 @@ int load_vms_from_configs(Hypervisor *hypervisor,
                           char **config_paths,
                           size_t config_count) {
     for (size_t i = 0; i < config_count; ++i) {
-        printf("Configuration file %zu: %s\n", i + 1, config_paths[i]);
+        if (!config_paths[i]) {
+            continue;
+        }
         VMConfig vmconfig;
         parse_config_file(config_paths[i], &vmconfig);
         add_vm(hypervisor, hypervisor->vm_count, &vmconfig);
