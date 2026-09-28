@@ -1107,10 +1107,12 @@ size_t execute_vm_slice(VM *vm) {
         MIPSInstruction *instruction = &vm->program.instructions[vm->current_instruction_index];
         if (validate_instruction(instruction) != 0) {
             report_execution_error(vm, instruction, "Invalid instruction");
+            vm->halted = true;
             break;
         }
         if (execute_instruction(vm, instruction) != 0) {
             report_execution_error(vm, instruction, "Execution error");
+            vm->halted = true;
             break;
         }
         advance_program_counter(vm);

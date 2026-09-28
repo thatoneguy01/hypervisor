@@ -6,7 +6,7 @@ set -o pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
-SRC_FILE="${1:-src.c}"
+SRC_FILE="${1:-hypervisor.c}"
 TEST_DIR="./test"
 HV="./hv"
 
