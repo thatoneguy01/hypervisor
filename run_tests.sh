@@ -28,6 +28,37 @@ passed=0
 failed=0
 total=0
 
+snapshot="./test/test_snapshot.bin"
+if python3 "./test/create_snapshot.py" "$snapshot" &&
+   "$HV" -s "$snapshot" > "./test/test_snapshot.actual" &&
+   diff -u "./test/test_snapshot.expected" "./test/test_snapshot.actual" > /dev/null; then
+    echo "[PASS] test_snapshot"
+    passed=$((passed + 1))
+    rm -f "./test/test_snapshot.actual"
+else
+    echo "[FAIL] test_snapshot"
+    if [[ -f "./test/test_snapshot.actual" ]]; then
+        diff -u "./test/test_snapshot.expected" "./test/test_snapshot.actual"
+    fi
+    failed=$((failed + 1))
+fi
+total=$((total + 1))
+
+if "$HV" -s "$snapshot" -v "./test/test00_initial.conf" > "./test/test_snapshot_mixed.actual" &&
+   cat "./test/test_snapshot.expected" "./test/test00_initial.expected" > "./test/test_snapshot_mixed.expected" &&
+   diff -u "./test/test_snapshot_mixed.expected" "./test/test_snapshot_mixed.actual" > /dev/null; then
+    echo "[PASS] test_snapshot_mixed_with_config"
+    passed=$((passed + 1))
+else
+    echo "[FAIL] test_snapshot_mixed_with_config"
+    if [[ -f "./test/test_snapshot_mixed.actual" ]]; then
+        diff -u "./test/test_snapshot_mixed.expected" "./test/test_snapshot_mixed.actual"
+    fi
+    failed=$((failed + 1))
+fi
+total=$((total + 1))
+rm -f "$snapshot" "./test/test_snapshot_mixed.actual" "./test/test_snapshot_mixed.expected"
+
 for config in "$TEST_DIR"/*.conf; do
     [[ -e "$config" ]] || continue
 

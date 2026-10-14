@@ -40,6 +40,7 @@ typedef struct MIPSRegisters
 
 typedef struct {
     char *paths[MIPS_MAX_VMS];
+    bool is_snapshot[MIPS_MAX_VMS];
     size_t count;
     bool ok;
 } ConfigPaths;
@@ -80,6 +81,7 @@ typedef enum Opcode
 
     OPCODE_LI,
     OPCODE_DUMP_PROCESSOR_STATE,
+    OPCODE_SNAPSHOT,
 
     OPCODE_ADD,
     OPCODE_SUB,
@@ -134,6 +136,7 @@ static const OpcodeMap OPCODE_TABLE[] =
 {
     { "li",                    OPCODE_LI },
     { "DUMP_PROCESSOR_STATE",  OPCODE_DUMP_PROCESSOR_STATE },
+    { "snapshot",              OPCODE_SNAPSHOT },
 
     { "add",                   OPCODE_ADD },
     { "sub",                   OPCODE_SUB },
@@ -299,7 +302,7 @@ int parse_config_file(const char *config_path, VMConfig *config) {
 
         if (strcmp(param_name, "vm_exec_slice_in_instructions") == 0) {
             parse_execution_slice(param_value, &config->vm_exec_slice_in_instructions);
-            config->vm_exec_slice_in_instructions = strtoul(param_value, nullptr, 0);
+            config->vm_exec_slice_in_instructions = strtoul(param_value, NULL, 0);
         } else if (strcmp(param_name, "vm_binary") == 0) {
             strncpy(config->vm_binary, param_value, PATH_MAX - 1);
         } else {
@@ -316,25 +319,26 @@ ConfigPaths parse_command_line(int argc, char **argv) {
    ConfigPaths result = { .count = 0, .ok = true };
    int opt;
 
-   while ((opt = getopt(argc, argv, "v:")) != -1) {
-       if (opt == 'v') {
+   while ((opt = getopt(argc, argv, "v:s:")) != -1) {
+      if (opt == 'v' || opt == 's') {
            if (result.count >= MIPS_MAX_VMS) {
-                fprintf(stderr, "Error: Exceeded maximum configuration files limit (%d).\n", MIPS_MAX_VMS);
+               fprintf(stderr, "Error: Exceeded maximum VM files limit (%d).\n", MIPS_MAX_VMS);
                 result.ok = false;
                 return result;
            }
             if (!path_exists(optarg)) {
-                fprintf(stderr, "Error: Configuration file '%s' does not exist.\n", optarg);
+               fprintf(stderr, "Error: VM file '%s' does not exist.\n", optarg);
                 result.ok = false;
                 return result;
             }
             result.paths[result.count++] = optarg;
-       }
-       else {
-           fprintf(stderr, "Usage: %s -v <config_file> [-v <config_file> ...]\n", argv[0]);
-           result.ok = false;
-           return result;
-       }
+           result.is_snapshot[result.count - 1] = (opt == 's');
+      }
+      else {
+          fprintf(stderr, "Usage: %s [-v <config_file> | -s <snapshot>] ...\n", argv[0]);
+          result.ok = false;
+          return result;
+      }
     }
     return result;
 }
@@ -348,7 +352,6 @@ void initialize_registers(MIPSRegisters *registers) {
     registers->lo = 0;
     registers->pc = DEFAULT_TEXT_BASE;
 }
-
 
 
 uint32_t read_register(const MIPSRegisters *registers,
@@ -656,6 +659,7 @@ int validate_instruction(const MIPSInstruction *instruction)
 
 
         case OPCODE_DUMP_PROCESSOR_STATE:
+        case OPCODE_SNAPSHOT:
             if (instruction->operand_count != 0)
                 return -1;
 
@@ -967,6 +971,514 @@ void dump_processor_state(const MIPSRegisters *registers) {
 }
 
 
+static int write_snapshot_data(FILE *file, const void *data, size_t size) {
+    return fwrite(data, 1, size, file) == size ? 0 : -1;
+}
+
+static int write_snapshot_string(FILE *file, const char *value) {
+    uint64_t length = value ? (uint64_t)strlen(value) : 0;
+
+    if (write_snapshot_data(file, &length, sizeof(length)) != 0 ||
+        (length > 0 && write_snapshot_data(file, value, (size_t)length) != 0)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int write_snapshot_operand(FILE *file, const Operand *operand) {
+    uint32_t type = (uint32_t)operand->type;
+
+    if (write_snapshot_data(file, &type, sizeof(type)) != 0) {
+        return -1;
+    }
+
+    switch (operand->type) {
+        case OPERAND_REGISTER: {
+            uint32_t register_number = operand->value.register_number;
+            return write_snapshot_data(file, &register_number, sizeof(register_number));
+        }
+        case OPERAND_IMMEDIATE:
+            return write_snapshot_data(file, &operand->value.immediate,
+                                       sizeof(operand->value.immediate));
+        case OPERAND_LABEL:
+            return write_snapshot_string(file, operand->value.label);
+        case OPERAND_NONE:
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+void save_snapshot(const VM *vm, const char *snapshot_path) {
+    static const unsigned char magic[8] = { 'H', 'V', 'S', 'N', 'A', 'P', '0', '1' };
+    const uint32_t format_version = 1;
+    uint64_t execution_slice;
+    uint64_t instruction_count;
+    uint64_t current_instruction_index;
+    uint32_t halted;
+    uint32_t text_base;
+    uint32_t vm_id;
+
+    if (vm == NULL || snapshot_path == NULL || snapshot_path[0] == '\0') {
+        fprintf(stderr, "Error: Invalid VM or snapshot path.\n");
+        return;
+    }
+
+    FILE *file = fopen(snapshot_path, "wb");
+    if (!file) {
+        fprintf(stderr, "Error: Could not open snapshot file '%s' for writing.\n",
+                snapshot_path);
+        return;
+    }
+
+    execution_slice = (uint64_t)vm->config.vm_exec_slice_in_instructions;
+    instruction_count = (uint64_t)vm->program.instruction_count;
+    current_instruction_index = (uint64_t)vm->current_instruction_index;
+    halted = vm->halted ? 1u : 0u;
+    text_base = vm->program.text_base;
+    vm_id = vm->vm_id;
+
+    int result = 0;
+    result |= write_snapshot_data(file, magic, sizeof(magic));
+    result |= write_snapshot_data(file, &format_version, sizeof(format_version));
+    result |= write_snapshot_data(file, &vm_id, sizeof(vm_id));
+    result |= write_snapshot_data(file, &execution_slice, sizeof(execution_slice));
+    result |= write_snapshot_string(file, vm->config.vm_binary);
+    result |= write_snapshot_data(file, vm->registers.gpr,
+                                  sizeof(vm->registers.gpr));
+    result |= write_snapshot_data(file, &vm->registers.hi, sizeof(vm->registers.hi));
+    result |= write_snapshot_data(file, &vm->registers.lo, sizeof(vm->registers.lo));
+    result |= write_snapshot_data(file, &vm->registers.pc, sizeof(vm->registers.pc));
+    result |= write_snapshot_data(file, &current_instruction_index,
+                                  sizeof(current_instruction_index));
+    result |= write_snapshot_data(file, &halted, sizeof(halted));
+    result |= write_snapshot_data(file, &text_base, sizeof(text_base));
+    result |= write_snapshot_data(file, &instruction_count, sizeof(instruction_count));
+
+    for (size_t i = 0; result == 0 && i < vm->program.instruction_count; ++i) {
+        const MIPSInstruction *instruction = &vm->program.instructions[i];
+        uint32_t opcode = (uint32_t)instruction->opcode;
+        uint32_t operand_count = (uint32_t)instruction->operand_count;
+        uint64_t source_line_number = (uint64_t)instruction->source_line_number;
+
+        if (instruction->operand_count > MIPS_MAX_OPERANDS) {
+            result = -1;
+            break;
+        }
+        result |= write_snapshot_data(file, &opcode, sizeof(opcode));
+        result |= write_snapshot_data(file, &operand_count, sizeof(operand_count));
+        result |= write_snapshot_data(file, &instruction->address,
+                                      sizeof(instruction->address));
+        result |= write_snapshot_data(file, &source_line_number,
+                                      sizeof(source_line_number));
+        for (size_t j = 0; result == 0 && j < MIPS_MAX_OPERANDS; ++j) {
+            result |= write_snapshot_operand(file, &instruction->operands[j]);
+        }
+    }
+
+    if (fclose(file) != 0) {
+        result = -1;
+    }
+    if (result != 0) {
+        fprintf(stderr, "Error: Failed while writing snapshot file '%s'.\n",
+                snapshot_path);
+    }
+}
+
+
+static int read_snapshot_data(FILE *file, void *data, size_t size) {
+    return fread(data, 1, size, file) == size ? 0 : -1;
+}
+
+static int read_snapshot_string(FILE *file, char *destination, size_t capacity) {
+    uint64_t length;
+
+    if (read_snapshot_data(file, &length, sizeof(length)) != 0 ||
+        length >= capacity) {
+        return -1;
+    }
+    if (length > 0 &&
+        read_snapshot_data(file, destination, (size_t)length) != 0) {
+        return -1;
+    }
+    destination[length] = '\0';
+    return 0;
+}
+
+static int read_snapshot_operand(FILE *file, Operand *operand) {
+    uint32_t type;
+
+    if (read_snapshot_data(file, &type, sizeof(type)) != 0 ||
+        type > OPERAND_LABEL) {
+        return -1;
+    }
+    operand->type = (OperandType)type;
+
+    switch (operand->type) {
+        case OPERAND_NONE:
+            return 0;
+        case OPERAND_REGISTER: {
+            uint32_t register_number;
+            if (read_snapshot_data(file, &register_number,
+                                   sizeof(register_number)) != 0 ||
+                register_number >= MIPS_REGISTER_COUNT) {
+                return -1;
+            }
+            operand->value.register_number = register_number;
+            return 0;
+        }
+        case OPERAND_IMMEDIATE:
+            return read_snapshot_data(file, &operand->value.immediate,
+                                      sizeof(operand->value.immediate));
+        case OPERAND_LABEL:
+            return read_snapshot_string(file, operand->value.label,
+                                        sizeof(operand->value.label));
+        default:
+            return -1;
+    }
+}
+
+VM load_snapshot(const char *snapshot_path) {
+    static const unsigned char expected_magic[8] =
+        { 'H', 'V', 'S', 'N', 'A', 'P', '0', '1' };
+    VM vm;
+    unsigned char magic[sizeof(expected_magic)];
+    uint32_t format_version;
+    uint64_t execution_slice;
+    uint64_t instruction_count;
+    uint64_t current_instruction_index;
+    uint32_t halted;
+    uint32_t text_base;
+    uint32_t vm_id;
+    int result = -1;
+
+    memset(&vm, 0, sizeof(vm));
+    if (snapshot_path == NULL || snapshot_path[0] == '\0') {
+        fprintf(stderr, "Error: Invalid snapshot path.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    FILE *file = fopen(snapshot_path, "rb");
+    if (!file) {
+        fprintf(stderr, "Error: Could not open snapshot file '%s' for reading.\n",
+                snapshot_path);
+        exit(EXIT_FAILURE);
+    }
+
+    if (read_snapshot_data(file, magic, sizeof(magic)) != 0 ||
+        memcmp(magic, expected_magic, sizeof(expected_magic)) != 0 ||
+        read_snapshot_data(file, &format_version, sizeof(format_version)) != 0 ||
+        format_version != 1 ||
+        read_snapshot_data(file, &vm_id, sizeof(vm_id)) != 0 ||
+        read_snapshot_data(file, &execution_slice, sizeof(execution_slice)) != 0 ||
+        execution_slice == 0 || execution_slice > SIZE_MAX ||
+        read_snapshot_string(file, vm.config.vm_binary,
+                             sizeof(vm.config.vm_binary)) != 0 ||
+        read_snapshot_data(file, vm.registers.gpr,
+                           sizeof(vm.registers.gpr)) != 0 ||
+        read_snapshot_data(file, &vm.registers.hi, sizeof(vm.registers.hi)) != 0 ||
+        read_snapshot_data(file, &vm.registers.lo, sizeof(vm.registers.lo)) != 0 ||
+        read_snapshot_data(file, &vm.registers.pc, sizeof(vm.registers.pc)) != 0 ||
+        read_snapshot_data(file, &current_instruction_index,
+                           sizeof(current_instruction_index)) != 0 ||
+        read_snapshot_data(file, &halted, sizeof(halted)) != 0 ||
+        halted > 1 ||
+        read_snapshot_data(file, &text_base, sizeof(text_base)) != 0 ||
+        read_snapshot_data(file, &instruction_count,
+                           sizeof(instruction_count)) != 0 ||
+        instruction_count > SIZE_MAX ||
+        instruction_count > SIZE_MAX / sizeof(MIPSInstruction) ||
+        current_instruction_index > instruction_count) {
+        goto failure;
+    }
+
+    vm.vm_id = vm_id;
+    vm.config.vm_exec_slice_in_instructions = (size_t)execution_slice;
+    vm.program.text_base = text_base;
+    vm.program.instruction_count = (size_t)instruction_count;
+    vm.program.instruction_capacity = (size_t)instruction_count;
+    vm.current_instruction_index = (size_t)current_instruction_index;
+    vm.halted = halted != 0;
+
+    if (instruction_count > 0) {
+        vm.program.instructions = calloc((size_t)instruction_count,
+                                         sizeof(MIPSInstruction));
+        if (vm.program.instructions == NULL) {
+            goto failure;
+        }
+    }
+
+    for (size_t i = 0; i < vm.program.instruction_count; ++i) {
+        MIPSInstruction *instruction = &vm.program.instructions[i];
+        uint32_t opcode;
+        uint32_t operand_count;
+        uint64_t source_line_number;
+
+        if (read_snapshot_data(file, &opcode, sizeof(opcode)) != 0 ||
+            opcode > OPCODE_SYSCALL ||
+            read_snapshot_data(file, &operand_count, sizeof(operand_count)) != 0 ||
+            operand_count > MIPS_MAX_OPERANDS ||
+            read_snapshot_data(file, &instruction->address,
+                               sizeof(instruction->address)) != 0 ||
+            read_snapshot_data(file, &source_line_number,
+                               sizeof(source_line_number)) != 0 ||
+            source_line_number > SIZE_MAX) {
+            goto failure;
+        }
+
+        instruction->opcode = (Opcode)opcode;
+        instruction->operand_count = (size_t)operand_count;
+        instruction->source_line_number = (size_t)source_line_number;
+        for (size_t j = 0; j < MIPS_MAX_OPERANDS; ++j) {
+            if (read_snapshot_operand(file, &instruction->operands[j]) != 0) {
+                goto failure;
+            }
+        }
+    }
+
+    result = 0;
+
+failure:
+    fclose(file);
+    if (result != 0) {
+        free(vm.program.instructions);
+        fprintf(stderr, "Error: Invalid or truncated snapshot file '%s'.\n",
+                snapshot_path);
+        exit(EXIT_FAILURE);
+    }
+    return vm;
+}
+
+static int read_text_string(const char *line, const char *key,
+                            char *value, size_t value_size) {
+    size_t key_length = strlen(key);
+    size_t line_length;
+
+    if (strncmp(line, key, key_length) != 0 ||
+        (line[key_length] != ' ' && line[key_length] != '\t')) {
+        return -1;
+    }
+    line += key_length;
+    while (*line == ' ' || *line == '\t') {
+        ++line;
+    }
+    line_length = strlen(line);
+    while (line_length > 0 &&
+           (line[line_length - 1] == '\n' || line[line_length - 1] == '\r')) {
+        --line_length;
+    }
+    if (line_length >= value_size) {
+        return -1;
+    }
+    memcpy(value, line, line_length);
+    value[line_length] = '\0';
+    return 0;
+}
+
+void save_snapshot_text(const VM *vm, const char *snapshot_path) {
+    if (vm == NULL || snapshot_path == NULL || snapshot_path[0] == '\0') {
+        fprintf(stderr, "Error: Invalid VM or text snapshot path.\n");
+        return;
+    }
+
+    FILE *file = fopen(snapshot_path, "w");
+    if (file == NULL) {
+        fprintf(stderr, "Error: Could not open text snapshot file '%s' for writing.\n",
+                snapshot_path);
+        return;
+    }
+
+    int result = fprintf(file,
+                         "# Hypervisor human-readable snapshot\n"
+                         "HV_SNAPSHOT_TEXT 1\n"
+                         "VM_ID %u\n"
+                         "EXECUTION_SLICE %zu\n"
+                         "VM_BINARY %s\n"
+                         "HI %u\n"
+                         "LO %u\n"
+                         "PC %u\n"
+                         "CURRENT_INSTRUCTION %zu\n"
+                         "HALTED %u\n"
+                         "TEXT_BASE %u\n"
+                         "INSTRUCTION_COUNT %zu\n",
+                         vm->vm_id, vm->config.vm_exec_slice_in_instructions,
+                         vm->config.vm_binary, vm->registers.hi, vm->registers.lo,
+                         vm->registers.pc, vm->current_instruction_index,
+                         vm->halted ? 1u : 0u, vm->program.text_base,
+                         vm->program.instruction_count);
+    for (unsigned int i = 0; result >= 0 && i < MIPS_REGISTER_COUNT; ++i) {
+        result = fprintf(file, "REGISTER %u %u\n", i, vm->registers.gpr[i]);
+    }
+    for (size_t i = 0; result >= 0 && i < vm->program.instruction_count; ++i) {
+        const MIPSInstruction *instruction = &vm->program.instructions[i];
+        result = fprintf(file, "INSTRUCTION %zu %s %u %zu %zu\n", i,
+                         opcode_to_string(instruction->opcode), instruction->address,
+                         instruction->source_line_number, instruction->operand_count);
+        for (size_t j = 0; result >= 0 && j < MIPS_MAX_OPERANDS; ++j) {
+            const Operand *operand = &instruction->operands[j];
+            switch (operand->type) {
+                case OPERAND_NONE:
+                    result = fprintf(file, "OPERAND %zu %zu NONE\n", i, j);
+                    break;
+                case OPERAND_REGISTER:
+                    result = fprintf(file, "OPERAND %zu %zu REGISTER %u\n", i, j,
+                                     operand->value.register_number);
+                    break;
+                case OPERAND_IMMEDIATE:
+                    result = fprintf(file, "OPERAND %zu %zu IMMEDIATE %d\n", i, j,
+                                     operand->value.immediate);
+                    break;
+                case OPERAND_LABEL:
+                    result = fprintf(file, "OPERAND %zu %zu LABEL %s\n", i, j,
+                                     operand->value.label);
+                    break;
+                default:
+                    result = -1;
+                    break;
+            }
+        }
+    }
+    if (result >= 0 && fclose(file) != 0) {
+        result = -1;
+    } else if (result < 0) {
+        fclose(file);
+    }
+    if (result < 0) {
+        fprintf(stderr, "Error: Failed while writing text snapshot file '%s'.\n",
+                snapshot_path);
+    }
+}
+
+VM load_snapshot_text(const char *snapshot_path) {
+    VM vm;
+    char line[MIPS_MAX_CONFIG_LINE];
+    size_t expected_instruction_count = 0;
+    size_t instructions_read = 0;
+    bool header_read = false;
+    bool instruction_count_read = false;
+    bool registers_read[MIPS_REGISTER_COUNT] = { false };
+    bool *instruction_read = NULL;
+    FILE *file;
+
+    memset(&vm, 0, sizeof(vm));
+    if (snapshot_path == NULL || snapshot_path[0] == '\0') {
+        fprintf(stderr, "Error: Invalid text snapshot path.\n");
+        exit(EXIT_FAILURE);
+    }
+    file = fopen(snapshot_path, "r");
+    if (file == NULL) {
+        fprintf(stderr, "Error: Could not open text snapshot file '%s' for reading.\n",
+                snapshot_path);
+        exit(EXIT_FAILURE);
+    }
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        unsigned int number;
+        unsigned int value;
+        size_t index;
+        size_t source_line_number;
+        size_t operand_count;
+        char word[64];
+        char value_text[MIPS_MAX_SOURCE_LINE];
+
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+        if (sscanf(line, "HV_SNAPSHOT_TEXT %u", &number) == 1) {
+            if (number != 1) goto failure;
+            header_read = true;
+        } else if (sscanf(line, "VM_ID %u", &vm.vm_id) == 1) {
+        } else if (sscanf(line, "EXECUTION_SLICE %zu",
+                          &vm.config.vm_exec_slice_in_instructions) == 1) {
+        } else if (read_text_string(line, "VM_BINARY", vm.config.vm_binary,
+                                    sizeof(vm.config.vm_binary)) == 0) {
+        } else if (sscanf(line, "HI %u", &vm.registers.hi) == 1) {
+        } else if (sscanf(line, "LO %u", &vm.registers.lo) == 1) {
+        } else if (sscanf(line, "PC %u", &vm.registers.pc) == 1) {
+        } else if (sscanf(line, "CURRENT_INSTRUCTION %zu",
+                          &vm.current_instruction_index) == 1) {
+        } else if (sscanf(line, "HALTED %u", &number) == 1) {
+            if (number > 1) goto failure;
+            vm.halted = number != 0;
+        } else if (sscanf(line, "TEXT_BASE %u", &vm.program.text_base) == 1) {
+        } else if (sscanf(line, "INSTRUCTION_COUNT %zu",
+                          &expected_instruction_count) == 1) {
+            instruction_count_read = true;
+            if (expected_instruction_count > SIZE_MAX / sizeof(MIPSInstruction)) goto failure;
+            vm.program.instructions = calloc(expected_instruction_count,
+                                             sizeof(MIPSInstruction));
+            instruction_read = calloc(expected_instruction_count, sizeof(bool));
+            if ((expected_instruction_count > 0 &&
+                 (vm.program.instructions == NULL || instruction_read == NULL))) {
+                goto failure;
+            }
+            vm.program.instruction_count = expected_instruction_count;
+            vm.program.instruction_capacity = expected_instruction_count;
+        } else if (sscanf(line, "REGISTER %u %u", &number, &value) == 2) {
+            if (number >= MIPS_REGISTER_COUNT || registers_read[number]) goto failure;
+            vm.registers.gpr[number] = value;
+            registers_read[number] = true;
+        } else if (sscanf(line, "INSTRUCTION %zu %63s %u %zu %zu",
+                          &index, word, &value, &source_line_number,
+                          &operand_count) == 5) {
+            MIPSInstruction *instruction;
+            if (!instruction_count_read || index >= expected_instruction_count ||
+                instruction_read[index] || parse_opcode(word) == OPCODE_INVALID) {
+                goto failure;
+            }
+            instruction = &vm.program.instructions[index];
+            instruction->opcode = parse_opcode(word);
+            instruction->address = value;
+            instruction->source_line_number = source_line_number;
+            instruction->operand_count = operand_count;
+            if (operand_count > MIPS_MAX_OPERANDS) goto failure;
+            instruction_read[index] = true;
+            ++instructions_read;
+        } else if (sscanf(line, "OPERAND %zu %u %63s %255[^\n]",
+                          &index, &number, word, value_text) == 4) {
+            Operand *operand;
+            if (!instruction_count_read || index >= expected_instruction_count ||
+                number >= MIPS_MAX_OPERANDS) goto failure;
+            operand = &vm.program.instructions[index].operands[number];
+            if (strcmp(word, "NONE") == 0) operand->type = OPERAND_NONE;
+            else if (strcmp(word, "REGISTER") == 0 &&
+                     sscanf(value_text, "%u", &value) == 1 &&
+                     value < MIPS_REGISTER_COUNT) {
+                operand->type = OPERAND_REGISTER;
+                operand->value.register_number = value;
+            } else if (strcmp(word, "IMMEDIATE") == 0 &&
+                       sscanf(value_text, "%d", &operand->value.immediate) == 1) {
+                operand->type = OPERAND_IMMEDIATE;
+            } else if (strcmp(word, "LABEL") == 0) {
+                char *label = trim_whitespace(value_text);
+                if (strlen(label) >= sizeof(operand->value.label)) goto failure;
+                strcpy(operand->value.label, label);
+                operand->type = OPERAND_LABEL;
+            } else goto failure;
+        } else {
+            goto failure;
+        }
+    }
+    fclose(file);
+    free(instruction_read);
+    if (!header_read || !instruction_count_read ||
+        vm.config.vm_exec_slice_in_instructions == 0 ||
+        instructions_read != expected_instruction_count ||
+        vm.current_instruction_index > expected_instruction_count) {
+        free(vm.program.instructions);
+        fprintf(stderr, "Error: Invalid text snapshot file '%s'.\n", snapshot_path);
+        exit(EXIT_FAILURE);
+    }
+    return vm;
+
+failure:
+    fclose(file);
+    free(instruction_read);
+    free(vm.program.instructions);
+    fprintf(stderr, "Error: Invalid text snapshot file '%s'.\n", snapshot_path);
+    exit(EXIT_FAILURE);
+}
+
 int execute_arithmetic_instruction(VM *vm,
                                    const MIPSInstruction *instruction) {
     switch (instruction->opcode) {
@@ -1028,6 +1540,7 @@ int execute_pseudo_instruction(VM *vm,
             dump_processor_state(&vm->registers);
             return 0;
 
+        case OPCODE_SNAPSHOT:
         default:
             fprintf(stderr, "Error: Unsupported pseudo-instruction %s\n", opcode_to_string(instruction->opcode));
             return -1;
@@ -1039,6 +1552,7 @@ int execute_instruction(VM *vm,
     switch (instruction->opcode) {
         case OPCODE_LI:
         case OPCODE_DUMP_PROCESSOR_STATE:
+        case OPCODE_SNAPSHOT:
             return execute_pseudo_instruction(vm, instruction);
 
         case OPCODE_ADD:
@@ -1178,14 +1692,25 @@ void destroy_hypervisor(Hypervisor *hypervisor) {
 
 int load_vms_from_configs(Hypervisor *hypervisor,
                           char **config_paths,
+                          const bool *is_snapshot,
                           size_t config_count) {
     for (size_t i = 0; i < config_count; ++i) {
         if (!config_paths[i]) {
             continue;
         }
-        VMConfig vmconfig;
-        parse_config_file(config_paths[i], &vmconfig);
-        add_vm(hypervisor, hypervisor->vm_count, &vmconfig);
+        if (is_snapshot[i]) {
+            VM vm = load_snapshot(config_paths[i]);
+            vm.vm_id = hypervisor->vm_count;
+            hypervisor->vms[hypervisor->vm_count++] = vm;
+        } else {
+            VMConfig vmconfig = { 0 };
+            if (parse_config_file(config_paths[i], &vmconfig) != 0 ||
+                vmconfig.vm_exec_slice_in_instructions == 0 ||
+                vmconfig.vm_binary[0] == '\0') {
+                return -1;
+            }
+            add_vm(hypervisor, hypervisor->vm_count, &vmconfig);
+        }
     }
     return 0;
 }
@@ -1197,12 +1722,16 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     if (config.count == 0) {
-        fprintf(stderr, "Error: No configuration files specified.\n");
+        fprintf(stderr, "Error: No VM configuration or snapshot files specified.\n");
         return EXIT_FAILURE;
     }
 
     Hypervisor hypervisor = initialize_hypervisor();
-    load_vms_from_configs(&hypervisor, config.paths, config.count);
+    if (load_vms_from_configs(&hypervisor, config.paths,
+                              config.is_snapshot, config.count) != 0) {
+        destroy_hypervisor(&hypervisor);
+        return EXIT_FAILURE;
+    }
     run_hypervisor(&hypervisor);
     destroy_hypervisor(&hypervisor);
     return EXIT_SUCCESS;
