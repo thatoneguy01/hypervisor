@@ -56,9 +56,41 @@ fi
 total=$((total + 1))
 rm -f "$snapshot" "./test/test_snapshot_creation.actual" "./test/test_snapshot_resume.actual"
 
+register_snapshot="./test/test_snapshot_registers.bin"
+rm -f "$register_snapshot" "./test/test_snapshot_registers_creation.actual" "./test/test_snapshot_registers_resume.actual"
+if "$HV" -v "./test/test_snapshot_registers.conf" > "./test/test_snapshot_registers_creation.actual" &&
+   [[ -s "$register_snapshot" ]] &&
+   diff -u "./test/test_snapshot_registers_creation.expected" "./test/test_snapshot_registers_creation.actual" > /dev/null; then
+    echo "[PASS] test_snapshot_registers_creation"
+    passed=$((passed + 1))
+else
+    echo "[FAIL] test_snapshot_registers_creation"
+    if [[ -f "./test/test_snapshot_registers_creation.actual" ]]; then
+        diff -u "./test/test_snapshot_registers_creation.expected" "./test/test_snapshot_registers_creation.actual"
+    fi
+    failed=$((failed + 1))
+fi
+total=$((total + 1))
+
+if [[ -s "$register_snapshot" ]] &&
+   "$HV" -s "$register_snapshot" > "./test/test_snapshot_registers_resume.actual" &&
+   diff -u "./test/test_snapshot_registers_resume.expected" "./test/test_snapshot_registers_resume.actual" > /dev/null; then
+    echo "[PASS] test_snapshot_registers_resume"
+    passed=$((passed + 1))
+else
+    echo "[FAIL] test_snapshot_registers_resume"
+    if [[ -f "./test/test_snapshot_registers_resume.actual" ]]; then
+        diff -u "./test/test_snapshot_registers_resume.expected" "./test/test_snapshot_registers_resume.actual"
+    fi
+    failed=$((failed + 1))
+fi
+total=$((total + 1))
+rm -f "$register_snapshot" "./test/test_snapshot_registers_creation.actual" "./test/test_snapshot_registers_resume.actual"
+
 for config in "$TEST_DIR"/*.conf; do
     [[ -e "$config" ]] || continue
     [[ "$config" == "./test/test_snapshot_creation.conf" ]] && continue
+    [[ "$config" == "./test/test_snapshot_registers.conf" ]] && continue
 
     total=$((total + 1))
 
