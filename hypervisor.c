@@ -1015,6 +1015,29 @@ static int write_snapshot_operand(FILE *file, const Operand *operand) {
     }
 }
 
+void save_snapshot(const VM *vm, const char *snapshot_path);
+
+static int execute_snapshot(VM *vm, const MIPSInstruction *instruction) {
+    VM snapshot_vm;
+
+    if (vm == NULL || instruction == NULL ||
+        instruction->operand_count != 1 ||
+        instruction->operands[0].type != OPERAND_LABEL) {
+        return -1;
+    }
+
+    /*
+     * Save the state that execution will have after this instruction
+     * completes. The program buffer is only borrowed by save_snapshot;
+     * it is not copied or freed here.
+     */
+    snapshot_vm = *vm;
+    snapshot_vm.current_instruction_index++;
+    snapshot_vm.registers.pc += MIPS_WORD_SIZE;
+    save_snapshot(&snapshot_vm, instruction->operands[0].value.label);
+    return 0;
+}
+
 void save_snapshot(const VM *vm, const char *snapshot_path) {
     static const unsigned char magic[8] = { 'H', 'V', 'S', 'N', 'A', 'P', '0', '1' };
     const uint32_t format_version = 1;
@@ -1028,20 +1051,6 @@ void save_snapshot(const VM *vm, const char *snapshot_path) {
     if (vm == NULL || snapshot_path == NULL || snapshot_path[0] == '\0') {
         fprintf(stderr, "Error: Invalid VM or snapshot path.\n");
         return;
-    }
-
-    static int execute_snapshot(VM *vm, const MIPSInstruction *instruction) {
-        VM snapshot_vm = *vm;
-
-        if (instruction->operand_count != 1 ||
-            instruction->operands[0].type != OPERAND_LABEL) {
-            return -1;
-        }
-
-        snapshot_vm.current_instruction_index++;
-        snapshot_vm.registers.pc += MIPS_WORD_SIZE;
-        save_snapshot(&snapshot_vm, instruction->operands[0].value.label);
-        return 0;
     }
 
     FILE *file = fopen(snapshot_path, "wb");
