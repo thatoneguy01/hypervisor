@@ -659,8 +659,14 @@ int validate_instruction(const MIPSInstruction *instruction)
 
 
         case OPCODE_DUMP_PROCESSOR_STATE:
-        case OPCODE_SNAPSHOT:
             if (instruction->operand_count != 0)
+                return -1;
+
+            return 0;
+
+        case OPCODE_SNAPSHOT:
+            if (instruction->operand_count != 1 ||
+                instruction->operands[0].type != OPERAND_LABEL)
                 return -1;
 
             return 0;
@@ -1022,6 +1028,20 @@ void save_snapshot(const VM *vm, const char *snapshot_path) {
     if (vm == NULL || snapshot_path == NULL || snapshot_path[0] == '\0') {
         fprintf(stderr, "Error: Invalid VM or snapshot path.\n");
         return;
+    }
+
+    static int execute_snapshot(VM *vm, const MIPSInstruction *instruction) {
+        VM snapshot_vm = *vm;
+
+        if (instruction->operand_count != 1 ||
+            instruction->operands[0].type != OPERAND_LABEL) {
+            return -1;
+        }
+
+        snapshot_vm.current_instruction_index++;
+        snapshot_vm.registers.pc += MIPS_WORD_SIZE;
+        save_snapshot(&snapshot_vm, instruction->operands[0].value.label);
+        return 0;
     }
 
     FILE *file = fopen(snapshot_path, "wb");
@@ -1541,6 +1561,8 @@ int execute_pseudo_instruction(VM *vm,
             return 0;
 
         case OPCODE_SNAPSHOT:
+            return execute_snapshot(vm, instruction);
+
         default:
             fprintf(stderr, "Error: Unsupported pseudo-instruction %s\n", opcode_to_string(instruction->opcode));
             return -1;
